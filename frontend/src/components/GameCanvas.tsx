@@ -40,12 +40,30 @@ export const GameCanvas = forwardRef<GameCanvasHandle, GameCanvasProps>(
       },
     }));
 
-    useEffect(() => {
-      if (!containerRef.current) return;
+    const callbacksRef = useRef<TableSceneCallbacks>({
+      onMatchStateChange,
+      onAimUpdate,
+    });
 
-      const callbacks: TableSceneCallbacks = {
+    // Keep callbacks updated dynamically
+    useEffect(() => {
+      callbacksRef.current = {
         onMatchStateChange,
         onAimUpdate,
+      };
+      sceneRef.current?.setCallbacks(callbacksRef.current);
+    }, [onMatchStateChange, onAimUpdate]);
+
+    useEffect(() => {
+      const container = containerRef.current;
+      if (!container) return;
+
+      // Clean any stale child canvases (e.g. from React 19 StrictMode re-mounts)
+      container.innerHTML = '';
+
+      const callbacks: TableSceneCallbacks = {
+        onMatchStateChange: (state) => callbacksRef.current.onMatchStateChange?.(state),
+        onAimUpdate: (params) => callbacksRef.current.onAimUpdate?.(params),
       };
 
       const scene = new TableScene();
@@ -53,7 +71,7 @@ export const GameCanvas = forwardRef<GameCanvasHandle, GameCanvasProps>(
 
       const config: Phaser.Types.Core.GameConfig = {
         type: Phaser.AUTO,
-        parent: containerRef.current,
+        parent: container,
         width: GAME_DIMENSIONS.width,
         height: GAME_DIMENSIONS.height,
         backgroundColor: '#090b10',
@@ -83,12 +101,15 @@ export const GameCanvas = forwardRef<GameCanvasHandle, GameCanvasProps>(
         game.destroy(true);
         gameRef.current = null;
         sceneRef.current = null;
+        if (container) {
+          container.innerHTML = '';
+        }
       };
     }, []);
 
     return (
-      <div className="relative w-full aspect-[1200/750] max-h-[72vh] flex items-center justify-center rounded-xl overflow-hidden shadow-2xl border border-slate-800 bg-[#090b10]">
-        <div ref={containerRef} className="w-full h-full flex items-center justify-center" />
+      <div className="relative w-full aspect-[1200/750] max-h-[72vh] rounded-xl overflow-hidden shadow-2xl border border-slate-800 bg-[#090b10]">
+        <div ref={containerRef} className="w-full h-full" />
       </div>
     );
   }

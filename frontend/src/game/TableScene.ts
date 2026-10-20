@@ -8,6 +8,7 @@ import type { PhysicsConfig, PlayerSetup } from './config';
 import type { MatchState, ShotParameters, GamePhase } from './types';
 import { Pen } from './Pen';
 import { soundManager } from './audio';
+import { isPenCenterInsideTable, calculatePredictedTrajectory } from './physicsUtils';
 
 export interface TableSceneCallbacks {
   onMatchStateChange?: (state: MatchState) => void;
@@ -37,10 +38,10 @@ export class TableScene extends Phaser.Scene {
   // Drag interaction state
   private isDraggingAim: boolean = false;
 
-
   // Settling tracking
   private settleTimer: number = 0;
   private simulateTimer: number = 0;
+  private roundResolveTimer: Phaser.Time.TimerEvent | null = null;
 
   // Visual layers
   private aimGraphics!: Phaser.GameObjects.Graphics;
@@ -59,6 +60,10 @@ export class TableScene extends Phaser.Scene {
     }
   }
 
+  public setCallbacks(callbacks: TableSceneCallbacks): void {
+    this.callbacks = { ...this.callbacks, ...callbacks };
+  }
+
   public create(): void {
     this.cameras.main.setBackgroundColor('#090b10');
 
@@ -68,6 +73,10 @@ export class TableScene extends Phaser.Scene {
     this.setupInputHandlers();
 
     this.aimGraphics = this.add.graphics().setDepth(20);
+
+    // Register lifecycle cleanup
+    this.events.once(Phaser.Scenes.Events.SHUTDOWN, this.shutdown, this);
+    this.events.once(Phaser.Scenes.Events.DESTROY, this.shutdown, this);
 
     // Initial turn setup
     this.setTurn(0);
@@ -177,20 +186,33 @@ export class TableScene extends Phaser.Scene {
 
           soundManager.playCollision(relSpeed);
 
-          // Spawn brief collision sparks
-          this.spawnCollisionSparks(pair.collision.supports[0]?.x ?? 0, pair.collision.supports[0]?.y ?? 0);
+          // Support point with fallback to midpoint between pen bodies
+          const contactX =
+            pair.collision.supports[0]?.x ??
+            (bodyA.penInstance.body.position.x + bodyB.penInstance.body.position.x) / 2;
+          const contactY =
+            pair.collision.supports[0]?.y ??
+            (bodyA.penInstance.body.position.y + bodyB.penInstance.body.position.y) / 2;
+
+          this.spawnCollisionSparks(contactX, contactY, relSpeed);
+
+          // Subtle tactile camera micro-shake on heavy hits
+          if (relSpeed > 7.0) {
+            this.cameras.main.shake(80, 0.0025);
+          }
         }
       });
     });
   }
 
-  private spawnCollisionSparks(x: number, y: number): void {
+  private spawnCollisionSparks(x: number, y: number, intensity: number = 2): void {
     if (!x || !y) return;
+    const radius = Math.min(7, 3 + intensity * 0.35);
     const spark = this.add.graphics().setDepth(25);
-    spark.fillStyle(0xfffbeb, 0.9);
-    spark.fillCircle(x, y, 4);
-    spark.lineStyle(1.5, 0xf59e0b, 0.8);
-    spark.strokeCircle(x, y, 8);
+    spark.fillStyle(0xfffbeb, 0.95);
+    spark.fillCircle(x, y, radius);
+    spark.lineStyle(1.5, 0xf59e0b, 0.85);
+    spark.strokeCircle(x, y, radius * 2);
 
     this.tweens.add({
       targets: spark,
@@ -228,7 +250,7 @@ export class TableScene extends Phaser.Scene {
       this.updateAimFromPointer(pointer);
     });
 
-    this.input.on('pointerup', () => {
+    const handlePointerRelease = () => {
       if (!this.isDraggingAim) return;
       this.isDraggingAim = false;
 
@@ -240,7 +262,10 @@ export class TableScene extends Phaser.Scene {
         this.phase = 'WAITING_FOR_AIM';
         this.emitState();
       }
-    });
+    };
+
+    this.input.on('pointerup', handlePointerRelease);
+    this.input.on('pointerupoutside', handlePointerRelease);
   }
 
   /**
@@ -287,9 +312,22 @@ export class TableScene extends Phaser.Scene {
     // 2. Render aiming vector on canvas
     this.renderAimVisuals();
 
-    // 3. Monitor simulation settling
+    // 3. Monitor simulation settling and real-time edge crossing
     if (this.phase === 'SIMULATING') {
       this.simulateTimer += delta;
+
+      // Real-time boundary check: eliminate pen the instant its center of mass leaves the table
+      for (const [id, pen] of this.pens.entries()) {
+        if (pen.state === 'ON_TABLE') {
+          const { x, y } = pen.body.position;
+          if (!isPenCenterInsideTable(x, y, GAME_DIMENSIONS.table)) {
+            pen.eliminate();
+            if (!this.eliminatedPlayerIds.includes(id)) {
+              this.eliminatedPlayerIds.push(id);
+            }
+          }
+        }
+      }
 
       let allSettled = true;
       for (const pen of this.pens.values()) {
@@ -319,7 +357,7 @@ export class TableScene extends Phaser.Scene {
   }
 
   /**
-   * Draws the aim trajectory line, power gauge arrow, and torque indicator
+   * Draws the aim trajectory line, power gauge arrow, predicted trajectory dots, and torque indicator
    */
   private renderAimVisuals(): void {
     this.aimGraphics.clear();
@@ -363,14 +401,20 @@ export class TableScene extends Phaser.Scene {
       endY + Math.sin(headAngle2) * headLen
     );
 
-    // Dashed guide / trajectory path
-    this.aimGraphics.lineStyle(1.5, 0xffffff, 0.35);
-    for (let d = arrowLength + 15; d < arrowLength + 90; d += 15) {
-      const p1X = impactPoint.x + Math.cos(angle) * d;
-      const p1Y = impactPoint.y + Math.sin(angle) * d;
-      const p2X = impactPoint.x + Math.cos(angle) * (d + 8);
-      const p2Y = impactPoint.y + Math.sin(angle) * (d + 8);
-      this.aimGraphics.lineBetween(p1X, p1Y, p2X, p2Y);
+    // Predicted trajectory dots along the slide vector
+    const trajectoryPoints = calculatePredictedTrajectory(
+      activePen.body.position.x,
+      activePen.body.position.y,
+      angle,
+      power,
+      GAME_DIMENSIONS.table,
+      6
+    );
+
+    for (const pt of trajectoryPoints) {
+      const dotColor = pt.isInsideTable ? arrowColor : 0xef4444; // Warning red if predicted past table boundary
+      this.aimGraphics.fillStyle(dotColor, pt.alpha);
+      this.aimGraphics.fillCircle(pt.x, pt.y, 3);
     }
 
     // Off-center torque spin indicator
@@ -433,19 +477,12 @@ export class TableScene extends Phaser.Scene {
     this.phase = 'ROUND_RESOLVING';
     this.emitState();
 
-    // 2. Check table boundaries for falling pens
-    const { table } = GAME_DIMENSIONS;
-    const newlyEliminated: string[] = [];
-
+    // 2. Final boundary check for any remaining pens
     for (const [id, pen] of this.pens.entries()) {
       if (pen.state === 'ON_TABLE') {
         const { x, y } = pen.body.position;
-        // Pen center of mass has fallen off table perimeter
-        const isOffTable = x < table.left || x > table.right || y < table.top || y > table.bottom;
-
-        if (isOffTable) {
+        if (!isPenCenterInsideTable(x, y, GAME_DIMENSIONS.table)) {
           pen.eliminate();
-          newlyEliminated.push(id);
           if (!this.eliminatedPlayerIds.includes(id)) {
             this.eliminatedPlayerIds.push(id);
           }
@@ -453,8 +490,15 @@ export class TableScene extends Phaser.Scene {
       }
     }
 
-    // Allow 750ms for drop animation and sound before advancing state
-    this.time.delayedCall(750, () => {
+    // Cancel any existing round resolve timer before starting a new one
+    if (this.roundResolveTimer) {
+      this.roundResolveTimer.destroy();
+      this.roundResolveTimer = null;
+    }
+
+    // Allow 650ms for drop animation and sound before advancing state
+    this.roundResolveTimer = this.time.delayedCall(650, () => {
+      this.roundResolveTimer = null;
       this.evaluateRoundOutcome();
     });
   }
@@ -530,15 +574,26 @@ export class TableScene extends Phaser.Scene {
       this.shotParams.angle = angle;
     }
 
+    // Synchronize React's aiming controls with the newly auto-calculated aim angle
+    this.callbacks.onAimUpdate?.(this.shotParams);
+
     this.emitState();
   }
 
   public resetMatch(): void {
+    // Cancel any pending round resolution timer
+    if (this.roundResolveTimer) {
+      this.roundResolveTimer.destroy();
+      this.roundResolveTimer = null;
+    }
+
     this.winner = null;
     this.isDraw = false;
     this.eliminatedPlayerIds = [];
     this.turnNumber = 1;
     this.isDraggingAim = false;
+    this.settleTimer = 0;
+    this.simulateTimer = 0;
 
     for (const pen of this.pens.values()) {
       pen.reset(this.physicsConfig);
@@ -577,6 +632,22 @@ export class TableScene extends Phaser.Scene {
   private getOpponentPen(): Pen | undefined {
     const oppIndex = (this.activePlayerIndex + 1) % PLAYERS_SETUP.length;
     return this.pens.get(PLAYERS_SETUP[oppIndex].id);
+  }
+
+  public shutdown(): void {
+    if (this.roundResolveTimer) {
+      this.roundResolveTimer.destroy();
+      this.roundResolveTimer = null;
+    }
+    this.matter.world.off('collisionstart');
+    this.input.off('pointerdown');
+    this.input.off('pointermove');
+    this.input.off('pointerup');
+    this.input.off('pointerupoutside');
+    for (const pen of this.pens.values()) {
+      pen.destroy();
+    }
+    this.pens.clear();
   }
 
   private emitState(): void {

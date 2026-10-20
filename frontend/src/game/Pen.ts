@@ -3,6 +3,7 @@ import { GAME_DIMENSIONS } from './config';
 import type { PhysicsConfig, PlayerSetup } from './config';
 import type { PenState } from './types';
 import { soundManager } from './audio';
+import { calculateImpactPoint } from './physicsUtils';
 
 export class Pen {
   public scene: Phaser.Scene;
@@ -150,19 +151,14 @@ export class Pen {
    * normalizedOffset: -1.0 (rear cap) to +1.0 (tip), 0.0 is center of mass.
    */
   public getImpactPointWorld(normalizedOffset: number): { x: number; y: number } {
-    const halfL = GAME_DIMENSIONS.pen.length / 2 - 8; // Margin from extreme tips
-    const clampedOffset = Math.max(-1.0, Math.min(1.0, normalizedOffset));
-    const localX = clampedOffset * halfL;
-    const localY = 0;
-
-    const angle = this.body.angle;
-    const cos = Math.cos(angle);
-    const sin = Math.sin(angle);
-
-    const worldX = this.body.position.x + (localX * cos - localY * sin);
-    const worldY = this.body.position.y + (localX * sin + localY * cos);
-
-    return { x: worldX, y: worldY };
+    const effectiveHalfL = GAME_DIMENSIONS.pen.length / 2 - 8;
+    return calculateImpactPoint(
+      this.body.position.x,
+      this.body.position.y,
+      this.body.angle,
+      normalizedOffset,
+      effectiveHalfL
+    );
   }
 
   /**
@@ -253,6 +249,9 @@ export class Pen {
     this.isEliminating = true;
     this.state = 'FALLING';
 
+    // Cancel any active tweens on the container before starting fall animation
+    this.scene.tweens.killTweensOf(this.container);
+
     soundManager.playTableFall();
     this.setActiveTurn(false);
     this.updateImpactMarker(0, false);
@@ -281,6 +280,9 @@ export class Pen {
    * Reset pen to start position
    */
   public reset(physicsConfig: PhysicsConfig): void {
+    // Kill any active elimination or transition tweens
+    this.scene.tweens.killTweensOf(this.container);
+
     this.isEliminating = false;
     this.state = 'ON_TABLE';
 
@@ -307,6 +309,7 @@ export class Pen {
   }
 
   public destroy(): void {
+    this.scene.tweens.killTweensOf(this.container);
     if (this.body && this.scene.matter.world.has(this.body)) {
       this.scene.matter.world.remove(this.body);
     }
